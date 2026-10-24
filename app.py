@@ -1,206 +1,143 @@
+﻿"""
+app.py - Streamlit Web Interface for StudyBuddy AI.
+Provides chat memory, live tool trace expanders, and persistent database dashboards.
 """
-app.py
-
-Main Streamlit Application for UniStudy AI.
-Provides a local study assistant interface with observable agent execution traces.
-"""
-
 import streamlit as st
-from typing import List, Dict, Any
+import json
+from agents.agent import StudyBuddyAgent
+from database.db import init_db, get_topic_analytics, get_latest_study_plan
 
-from llm.ollama_client import OllamaClient
-from tools.document_reader import read_document
-from utils.text_processing import chunk_document
-from agents.study_agent import StudyAgent
-
-# Page configuration
 st.set_page_config(
-    page_title="UniStudy AI",
+    page_title="StudyBuddy AI",
     page_icon="🎓",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
-# ---------------------------------------------------------
-# State Initialization
-# ---------------------------------------------------------
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+# Initialize database schema
+init_db()
 
-if "uploaded_docs" not in st.session_state:
-    st.session_state.uploaded_docs = {}  # filename -> metadata dict
+# Initialize session state
+if "agent" not in st.session_state:
+    st.session_state.agent = StudyBuddyAgent()
 
-if "all_chunks" not in st.session_state:
-    st.session_state.all_chunks = []  # Flat list of all chunk dicts
+if "chat_messages" not in st.session_state:
+    st.session_state.chat_messages = []
 
-
-# Cached client and agent
-@st.cache_resource
-def get_ollama_client(model_name: str = "llama3.2:3b") -> OllamaClient:
-    return OllamaClient(model=model_name)
-
-
-client = get_ollama_client()
-agent = StudyAgent(client=client)
-
-# ---------------------------------------------------------
-# Sidebar: System Health & Document Upload
-# ---------------------------------------------------------
+# ==============================================================================
+# Sidebar: Persistent Database Analytics & Revision Schedule
+# ==============================================================================
 with st.sidebar:
-    st.title("🎓 UniStudy AI")
-    st.caption("Local Academic Document & Study Assistant")
+    st.title("🎓 StudyBuddy Dashboard")
+    st.caption("Local LLM Agent using Ollama & SQLite")
+    
+    if st.button("🔄 Clear Conversation Memory", use_container_width=True):
+        st.session_state.agent.reset_conversation()
+        st.session_state.chat_messages = []
+        st.rerun()
 
-    st.subheader("1. System Health")
-    health = client.check_health()
-    if health["is_running"] and health["model_available"]:
-        st.success(f"● Ollama Active ({client.model})", icon="✅")
-    elif health["is_running"] and not health["model_available"]:
-        st.warning(f"Ollama running, but model '{client.model}' not found.\nRun `ollama pull {client.model}`.")
+    st.divider()
+    st.subheader("📊 Learning Progress")
+    analytics = get_topic_analytics()
+
+    if analytics:
+        for item in analytics:
+            pct = item["avg_pct_score"] or 0.0
+            status_color = "🟢" if pct >= 70.0 else "🔴"
+            st.markdown(
+                f"**{item['topic'].title()}** {status_color}\n"
+                f"- Avg Score: {pct}%\n"
+                f"- Attempts: {item['attempts_count']}"
+            )
     else:
-        st.error("Ollama is offline. Start the Ollama desktop service.")
+        st.info("No quiz attempts recorded yet.")
 
     st.divider()
+    st.subheader("📅 Active Revision Plan")
+    plan = get_latest_study_plan()
 
-    st.subheader("2. Upload Study Notes")
-    uploaded_files = st.file_uploader(
-        "Upload lecture PDFs, TXT, or MD files",
-        type=["pdf", "txt", "md"],
-        accept_multiple_files=True
-    )
+    if plan:
+        st.write(f"**Topics:** {', '.join(plan['topics'])}")
+        st.write(f"**Target:** {plan['available_minutes_per_day']} mins/day over {plan['days']} days")
+        with st.expander("View Full Schedule"):
+            for day in plan["schedule"]:
+                st.markdown(f"**Day {day['day']}: {day['primary_topic']}**")
+                for task in day["tasks"]:
+                    st.write(f"- {task}")
+    else:
+        st.info("No active study plan saved yet.")
 
-    if uploaded_files:
-        for file_obj in uploaded_files:
-            fname = file_obj.name
-            if fname not in st.session_state.uploaded_docs:
-                with st.spinner(f"Ingesting {fname}..."):
-                    doc_data = read_document(file_obj, fname)
-                    if doc_data.get("error"):
-                        st.error(f"Error reading {fname}: {doc_data['error']}")
-                    else:
-                        # Chunk the document
-                        chunks = chunk_document(doc_data, chunk_size_words=300, chunk_overlap_words=50)
-                        st.session_state.uploaded_docs[fname] = {
-                            "total_pages": doc_data["total_pages"],
-                            "chunk_count": len(chunks),
-                            "file_type": doc_data["file_type"]
-                        }
-                        st.session_state.all_chunks.extend(chunks)
+# ==============================================================================
+# Main Chat Area
+# ==============================================================================
+st.header("StudyBuddy AI Assistant")
+st.markdown("Your autonomous study tutor. Ask questions, request quizzes, or generate revision plans.")
 
-        st.success(f"{len(st.session_state.uploaded_docs)} document(s) indexed.")
-
-    # Show active documents
-    if st.session_state.uploaded_docs:
-        st.markdown("**Indexed Documents:**")
-        for doc_name, info in st.session_state.uploaded_docs.items():
-            st.markdown(f"- 📄 `{doc_name}` ({info['total_pages']} pg, {info['chunk_count']} chunks)")
-
-    st.divider()
-
-    # Session Management
-    st.subheader("3. Session Controls")
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("Clear Chat", use_container_width=True):
-            st.session_state.messages = []
-            st.rerun()
-    with col2:
-        if st.button("Reset All", use_container_width=True):
-            st.session_state.messages = []
-            st.session_state.uploaded_docs = {}
-            st.session_state.all_chunks = []
-            st.rerun()
-
-# ---------------------------------------------------------
-# Main Chat & Task Interface
-# ---------------------------------------------------------
-st.header("Academic Assistant Workspace")
-st.markdown("Ask questions about your uploaded documents, generate revision quizzes, or request structured summaries.")
-
-# Quick task prompt chips
-chip_col1, chip_col2, chip_col3 = st.columns(3)
-with chip_col1:
-    if st.button("📝 Summarize Uploaded Notes", use_container_width=True):
-        st.session_state.pending_prompt = "Please summarize the core concepts from my uploaded notes."
-with chip_col2:
-    if st.button("❓ Generate Practice Quiz", use_container_width=True):
-        st.session_state.pending_prompt = "Generate a 3-question multiple choice practice quiz from my notes."
-with chip_col3:
-    if st.button("✍️ Evaluate My Understanding", use_container_width=True):
-        st.session_state.pending_prompt = "Evaluate my answer: Gradient descent is when a model takes steps to find minimum error."
-
-# Render existing chat conversation
-for msg in st.session_state.messages:
+# Render previous messages from session state
+for msg in st.session_state.chat_messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
+        if "traces" in msg and msg["traces"]:
+            with st.expander("🛠️ Tool Execution Trace", expanded=False):
+                for trace in msg["traces"]:
+                    st.markdown(f"**Tool:** `{trace['tool']}`")
+                    st.markdown("**Arguments:**")
+                    st.json(trace["arguments"])
+                    st.markdown("**Result:**")
+                    st.json(trace["result"])
 
-        # If this assistant turn contains a tool execution trace, render it inside an expander
-        if msg.get("trace"):
-            with st.expander("🔍 View Agent Execution Trace", expanded=False):
-                for item in msg["trace"]:
-                    status_badge = "🟢 SUCCESS" if item["status"] == "success" else "🔴 FAILED"
-                    st.markdown(
-                        f"**Step {item['step']} | Tool:** `{item['tool']}` &nbsp;&nbsp; `{status_badge}`\n\n"
-                        f"- **Input:** {item['input_summary']}\n"
-                        f"- **Output:** {item['result_summary']}\n"
-                    )
+# User Input
+if prompt := st.chat_input("Ask a question, request a quiz, or build a study plan..."):
+    # Render user query
+    st.chat_message("user").markdown(prompt)
+    st.session_state.chat_messages.append({"role": "user", "content": prompt})
 
-        # If citations/sources were pulled, display them
-        if msg.get("sources"):
-            with st.expander("📚 Cited Source Passages", expanded=False):
-                for src in msg["sources"]:
-                    st.markdown(
-                        f"**From `{src.get('filename')}` — Page {src.get('page_num')}** (Score: {src.get('score', 'N/A')})")
-                    st.info(src.get("text", ""))
-
-# ---------------------------------------------------------
-# Input Handling
-# ---------------------------------------------------------
-user_input = st.chat_input("Ask a question about your documents, request a summary, or type a study query...")
-
-# Check if a chip button triggered a pending prompt
-if "pending_prompt" in st.session_state and st.session_state.pending_prompt:
-    user_input = st.session_state.pending_prompt
-    st.session_state.pending_prompt = None
-
-if user_input:
-    # 1. Render User Message
-    st.session_state.messages.append({"role": "user", "content": user_input})
-    with st.chat_message("user"):
-        st.markdown(user_input)
-
-    # 2. Execute Agent
+    # Prepare assistant response container
     with st.chat_message("assistant"):
-        with st.spinner("Agent analyzing request and selecting tools..."):
-            response = agent.run(
-                user_query=user_input,
-                document_chunks=st.session_state.all_chunks
-            )
+        traces = []
+        status_placeholder = st.empty()
+        response_placeholder = st.empty()
 
-        st.markdown(response["answer"])
+        # Step through agent loop generator
+        for step in st.session_state.agent.chat_step(prompt):
+            step_type = step.get("type")
 
-        # Render Agent Trace
-        if response.get("trace"):
-            with st.expander("🔍 View Agent Execution Trace", expanded=True):
-                for item in response["trace"]:
-                    status_badge = "🟢 SUCCESS" if item["status"] == "success" else "🔴 FAILED"
-                    st.markdown(
-                        f"**Step {item['step']} | Tool:** `{item['tool']}` &nbsp;&nbsp; `{status_badge}`\n\n"
-                        f"- **Input:** {item['input_summary']}\n"
-                        f"- **Output:** {item['result_summary']}\n"
-                    )
+            if step_type == "status":
+                status_placeholder.info(step.get("content"))
+            elif step_type == "tool_call":
+                current_call = {
+                    "tool": step.get("tool"),
+                    "arguments": step.get("arguments"),
+                    "result": None
+                }
+                traces.append(current_call)
+                status_placeholder.info(f"Executing tool `{step.get('tool')}`...")
+            elif step_type == "tool_result":
+                if traces:
+                    traces[-1]["result"] = step.get("result")
+            elif step_type == "final_response":
+                status_placeholder.empty()
+                response_content = step.get("content")
+                response_placeholder.markdown(response_content)
 
-        # Render Sources
-        if response.get("sources"):
-            with st.expander("📚 Cited Source Passages", expanded=False):
-                for src in response["sources"]:
-                    st.markdown(
-                        f"**From `{src.get('filename')}` — Page {src.get('page_num')}** (Score: {src.get('score', 'N/A')})")
-                    st.info(src.get("text", ""))
+                # Show tool trace expander if tools were invoked
+                if traces:
+                    with st.expander("🛠️ Tool Execution Trace", expanded=False):
+                        for trace in traces:
+                            st.markdown(f"**Tool:** `{trace['tool']}`")
+                            st.markdown("**Arguments:**")
+                            st.json(trace["arguments"])
+                            st.markdown("**Result:**")
+                            st.json(trace["result"])
 
-    # Save to session history
-    st.session_state.messages.append({
-        "role": "assistant",
-        "content": response["answer"],
-        "trace": response.get("trace", []),
-        "sources": response.get("sources", [])
-    })
+                # Persist in session state
+                st.session_state.chat_messages.append({
+                    "role": "assistant",
+                    "content": response_content,
+                    "traces": traces
+                })
+            elif step_type == "error":
+                status_placeholder.error(step.get("content"))
+
+    # Rerun to update sidebar statistics if database tools were executed
+    if traces:
+        st.rerun()
